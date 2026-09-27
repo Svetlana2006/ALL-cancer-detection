@@ -23,7 +23,7 @@ print(f"Using device: {DEVICE}")
 # Select your model here from the list below
 # Options: 'efficientnet_b0', 'efficientnetv2_rw_s', 'convnext_tiny', 
 #          'swin_tiny_patch4_window7_224', 'densenet121', 'resnet50'
-MODEL_NAME = 'efficientnetv2_rw_s' 
+MODEL_NAME = 'convnext_tiny' 
 
 # ==========================================
 # 2. Dataset Loading (Using KaggleHub)
