@@ -9,12 +9,13 @@ from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, confusion_m
 import kagglehub
 import timm  # Make sure to run: pip install timm scikit-learn
 import torch.nn.functional as F
+from tqdm import tqdm
 
 # ==========================================
 # 1. Configuration and Hyperparameters
 # ==========================================
 BATCH_SIZE = 32
-EPOCHS = 10
+EPOCHS = 25
 LEARNING_RATE = 1e-4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
@@ -85,7 +86,7 @@ def evaluate(model, dataloader):
     all_probs = []
     
     with torch.no_grad():
-        for images, labels in dataloader:
+        for images, labels in tqdm(dataloader, desc="Evaluating", leave=False):
             images, labels = images.to(DEVICE), labels.to(DEVICE)
             outputs = model(images)
             
@@ -126,7 +127,8 @@ for epoch in range(EPOCHS):
     model.train()
     running_loss = 0.0
     
-    for i, (images, labels) in enumerate(train_loader):
+    train_pbar = tqdm(train_loader, desc=f"Epoch [{epoch+1}/{EPOCHS}]")
+    for i, (images, labels) in enumerate(train_pbar):
         images, labels = images.to(DEVICE), labels.to(DEVICE)
         
         optimizer.zero_grad()
@@ -137,8 +139,8 @@ for epoch in range(EPOCHS):
         
         running_loss += loss.item()
         
-        if (i+1) % 50 == 0:
-            print(f"Epoch [{epoch+1}/{EPOCHS}], Step [{i+1}/{len(train_loader)}], Loss: {loss.item():.4f}")
+        # Update the progress bar suffix with the current loss
+        train_pbar.set_postfix({'loss': f"{loss.item():.4f}"})
             
     # Evaluate at the end of each epoch
     print("Evaluating on validation set...")
