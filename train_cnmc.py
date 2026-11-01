@@ -1,13 +1,13 @@
 import os
 import csv
 import math
-import re
 from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import ConcatDataset, DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, Subset
 from torchvision import datasets, transforms, models
+from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, confusion_matrix
 import kagglehub
 import torch.nn.functional as F
@@ -20,6 +20,7 @@ BATCH_SIZE = 32
 EPOCHS = 15
 LEARNING_RATE = 3e-4
 WEIGHT_DECAY = 1e-4
+VAL_SPLIT = 0.15
 IMG_SIZE = 224
 SEED = 42
 NUM_WORKERS = 2
@@ -28,7 +29,7 @@ NUM_CLASSES = 2
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
 
-MODEL_NAME = "swin_tiny_patch4_window7_224"
+MODEL_NAME = "efficientnet_b0"
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
@@ -57,30 +58,10 @@ def find_training_root(root: Path) -> Path:
     )
 
 
-def patient_id(image_path: str) -> str:
-    match = re.match(r"^UID_(H?\d+)_", Path(image_path).stem, re.IGNORECASE)
-    if match is None:
-        raise ValueError(f"Image filename does not contain a recognized patient ID: {image_path}")
-    return match.group(1).upper()
-
-
-def assert_patient_disjoint(train_datasets, val_dataset) -> None:
-    train_patients = {
-        patient_id(path)
-        for dataset in train_datasets
-        for path, _ in dataset.samples
-    }
-    val_patients = {patient_id(path) for path, _ in val_dataset.samples}
-    overlap = train_patients & val_patients
-    if overlap:
-        raise ValueError(
-            "Patient IDs appear in both training and validation folds: "
-            + ", ".join(sorted(overlap))
-        )
-
 dataset_root = Path(dataset_path)
 training_root = find_training_root(dataset_root)
-print(f"Using official folds under: {training_root}")
+fold_roots = [training_root / f"fold_{fold}" for fold in range(3)]
+print(f"Using notebook-style train/validation split across: {training_root}")
 
 imagenet_mean = [0.485, 0.456, 0.406]
 imagenet_std = [0.229, 0.224, 0.225]
@@ -100,24 +81,43 @@ transform_val = transforms.Compose([
     transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
 ])
 
-train_fold_datasets = [
-    datasets.ImageFolder(
-        root=str(training_root / f"fold_{fold}"), transform=transform_train
-    )
-    for fold in (0, 2)
+index_datasets = [
+    datasets.ImageFolder(root=str(fold_root), transform=None)
+    for fold_root in fold_roots
 ]
-val_dataset = datasets.ImageFolder(
-    root=str(training_root / "fold_1"), transform=transform_val
-)
-class_to_idx = train_fold_datasets[0].class_to_idx
-if any(dataset.class_to_idx != class_to_idx for dataset in train_fold_datasets[1:] + [val_dataset]):
+class_to_idx = index_datasets[0].class_to_idx
+if any(dataset.class_to_idx != class_to_idx for dataset in index_datasets[1:]):
     raise ValueError("Class folders differ between the official dataset folds.")
-assert_patient_disjoint(train_fold_datasets, val_dataset)
-
-train_dataset = ConcatDataset(train_fold_datasets)
-train_targets = np.concatenate(
-    [np.asarray(dataset.targets) for dataset in train_fold_datasets]
+targets = np.concatenate(
+    [np.asarray(dataset.targets) for dataset in index_datasets]
 )
+splitter = StratifiedShuffleSplit(
+    n_splits=1, test_size=VAL_SPLIT, random_state=SEED
+)
+train_indices, val_indices = next(
+    splitter.split(np.zeros_like(targets), targets)
+)
+train_dataset = Subset(
+    ConcatDataset([
+        datasets.ImageFolder(root=str(fold_root), transform=transform_train)
+        for fold_root in fold_roots
+    ]),
+    train_indices,
+)
+val_dataset = Subset(
+    ConcatDataset([
+        datasets.ImageFolder(root=str(fold_root), transform=transform_val)
+        for fold_root in fold_roots
+    ]),
+    val_indices,
+)
+if class_to_idx.get("all") != 0 or class_to_idx.get("hem") != 1:
+    raise ValueError(
+        f"Expected ImageFolder class mapping all=0, hem=1; got {class_to_idx}"
+    )
+positive_class = class_to_idx["all"]
+
+train_targets = targets[train_indices]
 class_sample_counts = np.bincount(train_targets, minlength=NUM_CLASSES)
 class_weights = class_sample_counts.sum() / (
     NUM_CLASSES * np.maximum(class_sample_counts, 1)
@@ -134,6 +134,7 @@ val_loader = DataLoader(
 )
 
 print(f"Classes: {class_to_idx}")
+print(f"Class mapping: {class_to_idx} (positive/cancer class: all)")
 print(f"Training images: {len(train_dataset)}; validation images: {len(val_dataset)}")
 print(f"Class weights: {class_weights.tolist()}")
 
@@ -187,8 +188,7 @@ def evaluate(model, dataloader, criterion):
             loss = criterion(outputs, labels)
             running_loss += loss.item() * images.size(0)
             
-            # Get probabilities for the positive class (class 1)
-            probs = F.softmax(outputs, dim=1)[:, 1]
+            probs = F.softmax(outputs, dim=1)[:, positive_class]
             _, preds = torch.max(outputs, 1)
             
             all_preds.extend(preds.cpu().numpy())
@@ -198,15 +198,17 @@ def evaluate(model, dataloader, criterion):
     # Calculate Metrics
     val_loss = running_loss / len(dataloader.dataset)
     acc = accuracy_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds)
-    auc = roc_auc_score(all_labels, all_probs)
+    positive_labels = np.asarray(all_labels) == positive_class
+    f1 = f1_score(all_labels, all_preds, average="weighted")
+    auc = roc_auc_score(positive_labels, all_probs)
     
-    cm = confusion_matrix(all_labels, all_preds)
-    # cm structure: [[TN, FP], [FN, TP]]
+    cm = confusion_matrix(
+        all_labels, all_preds, labels=[1 - positive_class, positive_class]
+    )
     if cm.shape == (2, 2):
         tn, fp, fn, tp = cm.ravel()
-        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0 # True Positive Rate / Recall
-        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0 # True Negative Rate
+        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
     else:
         sensitivity = 0.0
         specificity = 0.0
