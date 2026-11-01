@@ -58,10 +58,10 @@ def find_training_root(root: Path) -> Path:
 
 
 def patient_id(image_path: str) -> str:
-    match = re.match(r"^UID_(H?\d+)_", Path(image_path).stem)
+    match = re.match(r"^UID_(H?\d+)_", Path(image_path).stem, re.IGNORECASE)
     if match is None:
         raise ValueError(f"Image filename does not contain a recognized patient ID: {image_path}")
-    return match.group(1)
+    return match.group(1).upper()
 
 
 def assert_patient_disjoint(train_datasets, val_dataset) -> None:
