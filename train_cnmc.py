@@ -28,7 +28,7 @@ NUM_CLASSES = 2
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
 
-MODEL_NAME = "resnet50"
+MODEL_NAME = "swin_tiny_patch4_window7_224"
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
