@@ -1,13 +1,13 @@
 import os
 import csv
 import math
+import re
 from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import ConcatDataset, DataLoader
 from torchvision import datasets, transforms, models
-from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, confusion_matrix
 import kagglehub
 import torch.nn.functional as F
@@ -20,7 +20,6 @@ BATCH_SIZE = 32
 EPOCHS = 15
 LEARNING_RATE = 3e-4
 WEIGHT_DECAY = 1e-4
-VAL_SPLIT = 0.15
 IMG_SIZE = 224
 SEED = 42
 NUM_WORKERS = 2
@@ -41,20 +40,47 @@ print("Downloading/Locating dataset via kagglehub...")
 dataset_path = kagglehub.dataset_download("shafiullahshafin/c-nmc-2019-dataset")
 print(f"Dataset downloaded to: {dataset_path}")
 
-def find_class_dirs(root: Path) -> Path:
-    """Find a directory that directly contains the 'all' and 'hem' folders."""
+def find_training_root(root: Path) -> Path:
+    """Find the directory containing all three official, patient-separated folds."""
     root = root.resolve()
-    candidates = [root]
-    candidates.extend(path for path in root.rglob("*") if path.is_dir())
-    for path in candidates:
-        if (path / "all").is_dir() and (path / "hem").is_dir():
-            return path
-    raise FileNotFoundError(f"Could not find 'all' and 'hem' class folders under: {root}")
+    fold_zero_dirs = [path for path in root.rglob("fold_0") if path.is_dir()]
+    for fold_zero in fold_zero_dirs:
+        training_root = fold_zero.parent
+        fold_dirs = [training_root / f"fold_{index}" for index in range(3)]
+        if all(
+            (fold / "all").is_dir() and (fold / "hem").is_dir()
+            for fold in fold_dirs
+        ):
+            return training_root
+    raise FileNotFoundError(
+        f"Could not find fold_0, fold_1, and fold_2 with 'all'/'hem' folders under: {root}"
+    )
+
+
+def patient_id(image_path: str) -> str:
+    match = re.match(r"^UID_(H?\d+)_", Path(image_path).stem)
+    if match is None:
+        raise ValueError(f"Image filename does not contain a recognized patient ID: {image_path}")
+    return match.group(1)
+
+
+def assert_patient_disjoint(train_datasets, val_dataset) -> None:
+    train_patients = {
+        patient_id(path)
+        for dataset in train_datasets
+        for path, _ in dataset.samples
+    }
+    val_patients = {patient_id(path) for path, _ in val_dataset.samples}
+    overlap = train_patients & val_patients
+    if overlap:
+        raise ValueError(
+            "Patient IDs appear in both training and validation folds: "
+            + ", ".join(sorted(overlap))
+        )
 
 dataset_root = Path(dataset_path)
-preferred_data_root = dataset_root / "C-NMC 2019 (PKG)" / "C-NMC_training_data" / "fold_0"
-data_root = find_class_dirs(preferred_data_root if preferred_data_root.exists() else dataset_root)
-print(f"Using image folder: {data_root}")
+training_root = find_training_root(dataset_root)
+print(f"Using official folds under: {training_root}")
 
 imagenet_mean = [0.485, 0.456, 0.406]
 imagenet_std = [0.229, 0.224, 0.225]
@@ -74,19 +100,24 @@ transform_val = transforms.Compose([
     transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
 ])
 
-dataset_full = datasets.ImageFolder(root=str(data_root), transform=None)
-targets = np.array(dataset_full.targets)
-splitter = StratifiedShuffleSplit(n_splits=1, test_size=VAL_SPLIT, random_state=SEED)
-train_indices, val_indices = next(splitter.split(np.zeros_like(targets), targets))
-
-train_dataset = Subset(
-    datasets.ImageFolder(root=str(data_root), transform=transform_train), train_indices
+train_fold_datasets = [
+    datasets.ImageFolder(
+        root=str(training_root / f"fold_{fold}"), transform=transform_train
+    )
+    for fold in (0, 2)
+]
+val_dataset = datasets.ImageFolder(
+    root=str(training_root / "fold_1"), transform=transform_val
 )
-val_dataset = Subset(
-    datasets.ImageFolder(root=str(data_root), transform=transform_val), val_indices
-)
+class_to_idx = train_fold_datasets[0].class_to_idx
+if any(dataset.class_to_idx != class_to_idx for dataset in train_fold_datasets[1:] + [val_dataset]):
+    raise ValueError("Class folders differ between the official dataset folds.")
+assert_patient_disjoint(train_fold_datasets, val_dataset)
 
-train_targets = targets[train_indices]
+train_dataset = ConcatDataset(train_fold_datasets)
+train_targets = np.concatenate(
+    [np.asarray(dataset.targets) for dataset in train_fold_datasets]
+)
 class_sample_counts = np.bincount(train_targets, minlength=NUM_CLASSES)
 class_weights = class_sample_counts.sum() / (
     NUM_CLASSES * np.maximum(class_sample_counts, 1)
@@ -102,17 +133,31 @@ val_loader = DataLoader(
     num_workers=NUM_WORKERS, pin_memory=True,
 )
 
-class_to_idx = dataset_full.class_to_idx
 print(f"Classes: {class_to_idx}")
+print(f"Training images: {len(train_dataset)}; validation images: {len(val_dataset)}")
 print(f"Class weights: {class_weights.tolist()}")
 
 # ==========================================
 # 3. Model Initialization
 # ==========================================
 print(f"Initializing {MODEL_NAME}...")
-model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
-in_features = model.classifier[1].in_features
-model.classifier[1] = nn.Linear(in_features, NUM_CLASSES)
+if MODEL_NAME == "efficientnet_b0":
+    model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+    model.classifier[1] = nn.Linear(model.classifier[1].in_features, NUM_CLASSES)
+elif MODEL_NAME == "convnext_tiny":
+    model = models.convnext_tiny(weights=models.ConvNeXt_Tiny_Weights.DEFAULT)
+    model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, NUM_CLASSES)
+elif MODEL_NAME == "resnet50":
+    model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+    model.fc = nn.Linear(model.fc.in_features, NUM_CLASSES)
+elif MODEL_NAME == "densenet121":
+    model = models.densenet121(weights=models.DenseNet121_Weights.DEFAULT)
+    model.classifier = nn.Linear(model.classifier.in_features, NUM_CLASSES)
+elif MODEL_NAME == "swin_tiny_patch4_window7_224":
+    model = models.swin_t(weights=models.Swin_T_Weights.DEFAULT)
+    model.head = nn.Linear(model.head.in_features, NUM_CLASSES)
+else:
+    raise ValueError(f"Unsupported MODEL_NAME: {MODEL_NAME}")
 model = model.to(DEVICE)
 
 criterion = nn.CrossEntropyLoss(weight=class_weights.to(DEVICE))
