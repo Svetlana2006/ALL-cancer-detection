@@ -28,7 +28,7 @@ NUM_CLASSES = 2
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
 
-MODEL_NAME = "efficientnetv2_rw_s"
+MODEL_NAME = "efficientnetv2"
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
